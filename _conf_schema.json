@@ -8,18 +8,33 @@
     "description": "是否在控制台输出详细的审查日志",
     "type": "bool",
     "default": true,
-    "hint": "开启后，插件的每一次审查、重试、成功或失败都会在后台打印日志，便于追踪和调试。若想保持控制台清爽，可以关闭此项。"
+    "hint": "开启后，插件的每一次审查、重试、成功或失败都会在后台打印日志，便于追踪和调试。"
+  },
+  "whitelisted_user_ids": {
+    "description": "审查白名单用户ID (每行一个)",
+    "type": "text",
+    "default": "",
+    "hint": "在此处添加的用户ID所发送的消息将完全跳过所有审查流程（包括快速和深度审查）。请确保每行只填写一个用户ID。",
+    "extra": {
+      "is_text_area": true
+    }
   },
   "reviewer_provider_id": {
     "description": "用于内容审查的LLM提供商ID",
     "type": "string",
     "hint": "请在 LLM 提供商设置页面，复制您指定用于审查的小模型的ID并粘贴于此。若留空，【深度审查】功能将不会启用。"
   },
+  "reviewer_is_multimodal": {
+    "description": "审查模型是否支持多模态(识图)",
+    "type": "bool",
+    "default": false,
+    "hint": "开启前，请确保上方指定的审查模型支持视觉能力（如 GPT-4o, Gemini Pro Vision）。若您的审查模型是纯文本模型（如 DeepSeek, GPT-3.5），请务必关闭此项，否则可能导致审查报错。"
+  },
   "deep_review_context_depth": {
     "description": "深度审查时引用的对话历史轮次",
     "type": "int",
     "default": 2,
-    "hint": "设置在进行深度审查时，插件应向前追溯多少轮已通过的对话作为上下文参考。较大的值可以提高审查准确性，但会增加审查模型的token消耗。设置为0则不使用任何历史记录。"
+    "hint": "设置在进行深度审查时，插件应向前追溯多少轮已通过的对话作为上下文参考。设置为0则不使用任何历史记录。"
   },
   "retry_settings": {
     "description": "重试与循环审查配置",
@@ -29,19 +44,42 @@
         "description": "最大重试次数",
         "type": "int",
         "default": 3,
-        "hint": "当首次生成的内容未通过审查时，插件额外尝试重新生成的最大次数。例如，设置为3，则总共最多会生成4次内容（1次初稿 + 3次重试）。"
+        "hint": "当首次生成的内容未通过审查时，插件额外尝试重新生成的最大次数。"
       },
       "send_failure_message_on_max_retries": {
         "description": "达到重试上限时向用户发送提示",
         "type": "bool",
+        "default": true
+      },
+      "send_error_message_on_internal_failure": {
+        "description": "发生内部错误时向用户发送提示",
+        "type": "bool",
         "default": true,
-        "hint": "开启后，若内容在达到最大重试次数后仍无法通过审查，会向用户发送一条友好的失败提示。关闭则会静默处理，不发送任何消息。"
+        "hint": "开启后，若插件在审查过程中遇到无法恢复的内部错误，会向用户发送一条错误提示。"
+      },
+      "fallback_provider_id": {
+        "description": "备用LLM提供商ID",
+        "type": "string",
+        "default": "",
+        "hint": "当重试次数达到下方设定的阈值后，将切换到此ID对应的模型进行生成。"
+      },
+      "fallback_provider_is_multimodal": {
+        "description": "备用LLM提供商是否支持多模态",
+        "type": "bool",
+        "default": false,
+        "hint": "如果您的备用模型可以处理图片（例如 GPT-4V），请开启此项。如果它是一个纯文本模型，请务必关闭此项。"
+      },
+      "switch_provider_after_retries": {
+        "description": "切换到备用提供商的重试次数阈值",
+        "type": "int",
+        "default": 0,
+        "hint": "设置在第几次“重试”失败后启用备用提供商。设置为0则禁用此功能。"
       },
       "strict_review_mode": {
         "description": "严格审查模式",
         "type": "bool",
         "default": true,
-        "hint": "建议开启。开启后，若审查模型调用失败或返回无法解析的结果，将直接拦截消息。关闭则会放行原始消息，存在安全风险。"
+        "hint": "建议开启。开启后，若审查模型调用失败或返回无法解析的结果，将直接拦截消息。"
       }
     }
   },
@@ -52,35 +90,30 @@
       "enable_fast_review": {
         "description": "启用快速审查",
         "type": "bool",
-        "default": false,
-        "hint": "在调用审查模型前，通过此处的黑白名单规则进行第一轮过滤。这是一种高效率、低成本的审查方式，推荐开启。"
+        "default": false
       },
       "whitelist_regex": {
         "description": "白名单正则表达式 (格式: 规则名: 正则表达式)",
         "type": "text",
         "default": "",
-        "hint": "定义回复内容必须遵守的规则。只有满足此处的所有白名单条件，内容才会进入下一步审查。请按'规则名: 正则表达式'的格式添加，每行一条。例如，可用于规范回复格式：\n结尾标点: [。！？~]$",
         "extra": { "is_text_area": true }
       },
       "whitelist_prompts": {
         "description": "白名单驳回提示词 (格式: 规则名: 提示词)",
         "type": "text",
         "default": "",
-        "hint": "当回复未能满足上方某条白名单规则时，将使用此处的对应提示词来指导模型重试。规则名必须与上方完全对应。例如：\n结尾标点: 你的回复结尾缺少自然的标点符号，请像正常人一样在结尾加上句号、感叹号等。",
         "extra": { "is_text_area": true }
       },
       "blacklist_regex": {
         "description": "黑名单正则表达式 (格式: 规则名: 正则表达式)",
         "type": "text",
         "default": "禁止讨论政治人物: (总统|总理|主席|总书记|首相)\n禁止暴露身份: (我是AI|作为一个语言模型)",
-        "hint": "定义需要立即拦截的关键词或模式。只要回复内容匹配任意一条黑名单规则，就会被直接驳回并触发重试。规则名需要与下方的“黑名单驳回提示词”一一对应。",
         "extra": { "is_text_area": true }
       },
       "blacklist_prompts": {
         "description": "黑名单驳回提示词 (格式: 规则名: 提示词)",
         "type": "text",
         "default": "禁止讨论政治人物: 你的回复因提及“{trigger_word}”等政治敏感词汇被驳回。为确保安全合规，请完全避免讨论任何国家、领导人、政党及相关政治话题，并重写你的回复。\n禁止暴露身份: 你的回复因提及“{trigger_word}”而暴露了AI身份，请修正。",
-        "hint": "当回复触发上方对应的黑名单规则时，将使用此处的提示词来指导模型重试。提示词中的 {trigger_word} 占位符会被自动替换为触发规则的具体词语。",
         "extra": { "is_text_area": true }
       }
     }
@@ -93,17 +126,13 @@
         "description": "所有重试都失败后的最终回复消息",
         "type": "text",
         "default": "抱歉，我多次尝试后仍无法生成完全合规的回复，为安全起见，本次回答已取消。",
-        "extra": {
-          "is_text_area": true
-        }
+        "extra": { "is_text_area": true }
       },
       "internal_error": {
         "description": "插件遇到内部错误（如无法调用模型）时的回复",
         "type": "text",
         "default": "抱歉，内容审查服务暂时出现问题，本次回答已取消。",
-        "extra": {
-          "is_text_area": true
-        }
+        "extra": { "is_text_area": true }
       }
     }
   },
@@ -111,18 +140,14 @@
     "description": "重试时专用的系统提示词 (System Prompt)",
     "type": "text",
     "default": "",
-    "hint": "为重试环节指定一个专用的系统提示词。如果留空，插件将沿用对话原始的系统提示词。请注意：一旦填写，此处内容将在重试时“完全替换”掉原始的系统提示词，而非补充。",
-    "extra": {
-      "is_text_area": true
-    }
+    "hint": "如果留空，插件将沿用对话原始的系统提示词。请注意：一旦填写，此处内容将在重试时“完全替换”掉原始的系统提示词。",
+    "extra": { "is_text_area": true }
   },
   "reviewer_system_prompt": {
-    "description": "这是审查模型的“总指令”模板，定义了它的核心任务和输出格式。其中的占位符会根据下方“审查级别配置”中的具体规则动态填充。",
+    "description": "审查模型的“总指令”模板",
     "type": "text",
     "default": "你是一个AI内容审查员。你的任务是根据以下规则，对AI生成的回复进行严格审查。你的最终输出必须是一个严格的、不包含任何额外解释的JSON对象，格式如下：\n\n{\n  \"political\": { \"result\": \"<PASS/FAIL>\", \"reason\": \"[你的理由]\" },\n  \"pornographic\": { \"result\": \"<PASS/FAIL>\", \"reason\": \"[你的理由]\" },\n  \"verbal_abuse\": { \"result\": \"<PASS/FAIL>\", \"reason\": \"[你的理由]\" },\n  \"custom_rule\": { \"result\": \"<PASS/FAIL>\", \"reason\": \"[你的理由]\" }\n}\n\n--- 以下是审查规则 ---\n{political_rules_block}\n\n{pornographic_rules_block}\n\n{verbal_abuse_rules_block}\n\n{custom_rules_block}",
-    "extra": {
-      "is_text_area": true
-    }
+    "extra": { "is_text_area": true }
   },
   "review_levels": {
     "description": "审查级别配置。在此处开启/关闭特定审查项，并定义其审查标准。",
@@ -178,34 +203,32 @@
     "description": "定义审查失败后，用于指导主模型修正回复的指令模板。",
     "type": "text",
     "default": "警告：你的上一个回复因不合规被系统驳回。\n用户的最新提问是：“{user_prompt}”\n你的错误回复是：“{failed_response}”\n\n请严格根据以下指导意见修正你的回复：\n--- 指导意见 ---\n{review_comment}\n--- 指导意见结束 ---\n\n请直接生成修正后的内容，不要包含任何道歉。",
-    "extra": {
-      "is_text_area": true
-    }
+    "extra": { "is_text_area": true }
   },
   "retry_guidance": {
-    "description": "模块化重试指导。您可以为每个独立的审查维度（政治、色情等）定制更有针对性的重试指令。",
+    "description": "模块化重试指导。您可以为每个独立的审查维度定制更有针对性的重试指令。",
     "type": "object",
     "items": {
       "political": {
-        "description": "当[政治敏感]审查失败时的指导意见。{reason}会被替换为审查员给出的具体原因。",
+        "description": "当[政治敏感]审查失败时的指导意见。",
         "type": "text",
         "default": "你的回复因【政治敏感】被驳回。具体原因：{reason} 请在重写时移除所有与现实世界国家、政治人物、党派、历史政治事件相关的敏感或争议性内容。",
         "extra": { "is_text_area": true }
       },
       "pornographic": {
-        "description": "当[色情低俗]审查失败时的指导意见。{reason}会被替换为审查员给出的具体原因。",
+        "description": "当[色情低俗]审查失败时的指导意见。",
         "type": "text",
         "default": "你的回复因【色情低俗】被驳回。具体原因：{reason} 请在重写时移除所有色情、性暗示、低俗或不雅的描述。",
         "extra": { "is_text_area": true }
       },
       "verbal_abuse": {
-        "description": "当[言语辱骂]审查失败时的指导意见。{reason}会被替换为审查员给出的具体原因。",
+        "description": "当[言语辱骂]审查失败时的指导意见。",
         "type": "text",
         "default": "你的回复因【言语辱骂】被驳回。具体原因：{reason} 请在重写时使用更加礼貌、中立和友善的语言，移除所有人身攻击、侮辱或歧视性词汇。",
         "extra": { "is_text_area": true }
       },
       "custom_rule": {
-        "description": "当[自定义规则]审查失败时的指导意见。{reason}会被替换为审查员给出的具体原因。",
+        "description": "当[自定义规则]审查失败时的指导意见。",
         "type": "text",
         "default": "你的回复因【自定义规则】被驳回。具体原因：{reason} 请根据自定义规则的要求进行修改。",
         "extra": { "is_text_area": true }

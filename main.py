@@ -1,10 +1,10 @@
 # main.py
 
-# 导入所需的标准库和框架组件
+# 导入所需的标准库
 import json
 import re
 from collections import deque, defaultdict, OrderedDict
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Set
 import asyncio
 from dataclasses import dataclass, field
 
@@ -16,7 +16,10 @@ from astrbot.api import AstrBotConfig, logger
 
 @dataclass
 class ReviewCycleResult:
-    """封装单次审查循环结果的数据类，使函数返回更结构化。"""
+    """
+    审查结果数据类。
+    用于封装单次审查循环（快速审查+深度审查）的返回结果，使逻辑传递更清晰。
+    """
     is_passed: bool
     review_comment: str
     failed_categories: List[str] = field(default_factory=list)
@@ -25,31 +28,48 @@ class ReviewCycleResult:
 @dataclass
 class ReviewerConfig:
     """
-    封装插件所有配置的加载、解析和验证逻辑，提高主类的内聚性。
+    配置管理类。
+    负责插件所有配置项的加载、解析、验证以及默认值处理。
     """
-    # --- 配置键名常量化 ---
+    # --- 配置键名常量 ---
     class CfgKeys:
         ENABLED = "enabled"
         ENABLE_CONSOLE_LOGGING = "enable_console_logging"
+        # 白名单
+        WHITELISTED_USER_IDS = "whitelisted_user_ids"
+        # 审查模型配置
         REVIEWER_PROVIDER_ID = "reviewer_provider_id"
+        REVIEWER_IS_MULTIMODAL = "reviewer_is_multimodal" # [新增]
         DEEP_REVIEW_CONTEXT_DEPTH = "deep_review_context_depth"
         HISTORY_SAVE_INTERVAL = "history_save_interval_seconds"
+        
+        # 重试与备用模型配置
         RETRY_SETTINGS = "retry_settings"
         MAX_RETRIES = "max_retries"
         SEND_FAILURE_MESSAGE = "send_failure_message_on_max_retries"
+        SEND_ERROR_MESSAGE = "send_error_message_on_internal_failure"
         STRICT_REVIEW_MODE = "strict_review_mode"
+        FALLBACK_PROVIDER_ID = "fallback_provider_id"
+        SWITCH_PROVIDER_AFTER = "switch_provider_after_retries"
+        FALLBACK_IS_MULTIMODAL = "fallback_provider_is_multimodal"
+        
+        # 快速审查配置
         FAST_REVIEW_SETTINGS = "fast_review_settings"
         ENABLE_FAST_REVIEW = "enable_fast_review"
         WHITELIST_REGEX = "whitelist_regex"
         WHITELIST_PROMPTS = "whitelist_prompts"
         BLACKLIST_REGEX = "blacklist_regex"
         BLACKLIST_PROMPTS = "blacklist_prompts"
+        
+        # 提示语配置
         USER_MESSAGES = "user_facing_messages"
         FINAL_FAILURE_MESSAGE = "final_failure"
         INTERNAL_ERROR_MESSAGE = "internal_error"
         RETRY_SYSTEM_PROMPT = "retry_system_prompt"
         RETRY_INSTRUCTION_PROMPT = "retry_instruction_prompt"
         RETRY_GUIDANCE = "retry_guidance"
+        
+        # 审查规则配置
         REVIEW_LEVELS = "review_levels"
         REVIEWER_SYSTEM_PROMPT = "reviewer_system_prompt"
         ENABLE_POLITICAL = "enable_political"
@@ -61,7 +81,7 @@ class ReviewerConfig:
         ENABLE_CUSTOM_RULE = "enable_custom_rule"
         CUSTOM_RULE_PROMPT = "custom_rule_prompt"
 
-    # --- 将常量移入配置类内部 ---
+    # --- 内部常量 ---
     POLITICAL = "political"
     PORNOGRAPHIC = "pornographic"
     VERBAL_ABUSE = "verbal_abuse"
@@ -70,11 +90,13 @@ class ReviewerConfig:
     PASS = "PASS"
     REASON_SUFFIX = "_reason"
 
-    # --- 配置属性 ---
+    # --- 基础属性 ---
     raw_config: AstrBotConfig
+    whitelisted_user_ids: Set[str] = field(default_factory=set)
+    reviewer_is_multimodal: bool = False # [新增]
 
-    # 在 dataclass 的 __post_init__ 中自动调用所有加载方法
     def __post_init__(self):
+        """初始化后自动加载所有配置"""
         self._load_core_settings()
         self._load_retry_settings()
         self._load_fast_review_settings()
@@ -82,46 +104,65 @@ class ReviewerConfig:
         self._load_user_messages_and_prompts()
         self._validate_plugin_state()
         
-    # --- 配置加载方法 ---
     def _load_core_settings(self):
+        """加载核心设置"""
         self.enabled = self.raw_config.get(self.CfgKeys.ENABLED, False)
         self.log_to_console = self.raw_config.get(self.CfgKeys.ENABLE_CONSOLE_LOGGING, True)
         self.reviewer_provider_id = self.raw_config.get(self.CfgKeys.REVIEWER_PROVIDER_ID, "")
+        self.reviewer_is_multimodal = self.raw_config.get(self.CfgKeys.REVIEWER_IS_MULTIMODAL, False) # [新增]
         self.deep_review_context_depth = self.raw_config.get(self.CfgKeys.DEEP_REVIEW_CONTEXT_DEPTH, 2)
         self.save_interval_seconds = self.raw_config.get(self.CfgKeys.HISTORY_SAVE_INTERVAL, 300)
+        
+        # 解析白名单用户ID
+        whitelisted_ids_str = self.raw_config.get(self.CfgKeys.WHITELISTED_USER_IDS, "")
+        self.whitelisted_user_ids = {uid.strip() for uid in whitelisted_ids_str.splitlines() if uid.strip()}
+        if self.whitelisted_user_ids and self.log_to_console:
+            logger.info(f"[ReviewerPlugin] 已加载 {len(self.whitelisted_user_ids)} 个白名单用户。")
 
     def _load_retry_settings(self):
+        """加载重试、备用模型及错误处理配置"""
         retry_settings = self.raw_config.get(self.CfgKeys.RETRY_SETTINGS, {})
         self.max_attempts = retry_settings.get(self.CfgKeys.MAX_RETRIES, 3) + 1
         self.send_failure_message = retry_settings.get(self.CfgKeys.SEND_FAILURE_MESSAGE, True)
+        self.send_error_message = retry_settings.get(self.CfgKeys.SEND_ERROR_MESSAGE, True)
         self.strict_mode = retry_settings.get(self.CfgKeys.STRICT_REVIEW_MODE, True)
+        
+        # 备用模型配置
+        self.fallback_provider_id = retry_settings.get(self.CfgKeys.FALLBACK_PROVIDER_ID, "")
+        self.switch_provider_after_retries = retry_settings.get(self.CfgKeys.SWITCH_PROVIDER_AFTER, 0)
+        self.fallback_provider_is_multimodal = retry_settings.get(self.CfgKeys.FALLBACK_IS_MULTIMODAL, False)
 
     def _load_fast_review_settings(self):
+        """加载基于正则的快速审查配置"""
         fast_review_config = self.raw_config.get(self.CfgKeys.FAST_REVIEW_SETTINGS, {})
         self.fast_review_enabled = fast_review_config.get(self.CfgKeys.ENABLE_FAST_REVIEW, False)
         self.whitelist_rules = self._parse_key_value_config(fast_review_config.get(self.CfgKeys.WHITELIST_REGEX, ""), fast_review_config.get(self.CfgKeys.WHITELIST_PROMPTS, ""))
         self.blacklist_rules = self._parse_key_value_config(fast_review_config.get(self.CfgKeys.BLACKLIST_REGEX, ""), fast_review_config.get(self.CfgKeys.BLACKLIST_PROMPTS, ""))
         if self.fast_review_enabled and self.log_to_console:
-            logger.info(f"[ReviewerPlugin] 【快速审查】模块已启用。加载了 {len(self.whitelist_rules)} 条白名单规则和 {len(self.blacklist_rules)} 条黑名单规则。")
+            logger.info(f"[ReviewerPlugin] 快速审查已启用 (白名单规则: {len(self.whitelist_rules)}, 黑名单规则: {len(self.blacklist_rules)})。")
 
     def _load_deep_review_settings(self):
+        """加载基于LLM的深度审查配置"""
         if not self.reviewer_provider_id:
-            logger.info("[ReviewerPlugin] 未配置 'reviewer_provider_id'，【深度审查】功能将不会激活。")
+            logger.info("[ReviewerPlugin] 未配置审查模型ID，深度审查功能将不启用。")
             self.final_reviewer_system_prompt = ""
             self.review_configs = {}
             return
-        logger.info(f"[ReviewerPlugin] 【深度审查】功能已配置，将使用模型: '{self.reviewer_provider_id}' (运行时检查可用性)。")
+        
+        logger.info(f"[ReviewerPlugin] 深度审查功能已配置 (Model: {self.reviewer_provider_id}, Multimodal: {self.reviewer_is_multimodal})。")
         self._build_reviewer_system_prompt()
 
     def _load_user_messages_and_prompts(self):
+        """加载提示语模板"""
         messages_config = self.raw_config.get(self.CfgKeys.USER_MESSAGES, {})
-        self.final_failure_message = messages_config.get(self.CfgKeys.FINAL_FAILURE_MESSAGE, "抱歉，我多次尝试后仍无法生成完全合规的回复，为安全起见，本次回答已取消。")
-        self.internal_error_message = messages_config.get(self.CfgKeys.INTERNAL_ERROR_MESSAGE, "抱歉，内容审查服务暂时出现问题，本次回答已取消。")
+        self.final_failure_message = messages_config.get(self.CfgKeys.FINAL_FAILURE_MESSAGE, "抱歉，无法生成合规内容。")
+        self.internal_error_message = messages_config.get(self.CfgKeys.INTERNAL_ERROR_MESSAGE, "服务暂时出现问题。")
         self.retry_system_prompt = self.raw_config.get(self.CfgKeys.RETRY_SYSTEM_PROMPT, "")
         self.retry_instruction_prompt = self.raw_config.get(self.CfgKeys.RETRY_INSTRUCTION_PROMPT, "")
         self.retry_guidance = self.raw_config.get(self.CfgKeys.RETRY_GUIDANCE, {})
 
     def _build_reviewer_system_prompt(self):
+        """根据启用的规则动态构建审查员的System Prompt"""
         review_levels_config = self.raw_config.get(self.CfgKeys.REVIEW_LEVELS, {})
         self.review_configs = {
             self.POLITICAL: {"enabled": review_levels_config.get(self.CfgKeys.ENABLE_POLITICAL, True), "name": "政治敏感"},
@@ -142,48 +183,58 @@ class ReviewerConfig:
 
     def _validate_plugin_state(self):
         if self.enabled and not self.fast_review_enabled and not self.reviewer_provider_id:
-            logger.warning("[ReviewerPlugin] 插件主开关已开启，但【快速审查】未启用且未配置审查模型ID，插件将不执行任何审查操作。")
+            logger.warning("[ReviewerPlugin] 插件已开启，但所有审查模块均未配置，插件将处于空闲状态。")
 
     def _parse_key_value_config(self, regex_str: str, prompt_str: str) -> 'OrderedDict':
         rules = OrderedDict()
         line_pattern = re.compile(r"^\s*([^:]+?)\s*:\s*(.*)$")
-        def parse_to_map(text: str) -> dict:
-            parsed_map = {}
-            for line in text.strip().split('\n'):
-                match = line_pattern.match(line)
-                if match:
-                    key, value = match.groups()
-                    if key and value: parsed_map[key.strip()] = value.strip()
-            return parsed_map
-        regex_map, prompt_map = parse_to_map(regex_str), parse_to_map(prompt_str)
+        regex_map, prompt_map = {}, {}
+        
+        for line in regex_str.strip().split('\n'):
+            match = line_pattern.match(line)
+            if match: regex_map[match.group(1).strip()] = match.group(2).strip()
+        
+        for line in prompt_str.strip().split('\n'):
+            match = line_pattern.match(line)
+            if match: prompt_map[match.group(1).strip()] = match.group(2).strip()
+            
         for key, regex_pattern in regex_map.items():
             if key in prompt_map:
-                try: rules[key] = {"regex": re.compile(regex_pattern), "prompt": prompt_map[key]}
-                except re.error as e: logger.error(f"[ReviewerPlugin] 快速审查规则 '{key}' 的正则表达式编译失败: {e}")
+                try:
+                    rules[key] = {"regex": re.compile(regex_pattern), "prompt": prompt_map[key]}
+                except re.error as e:
+                    logger.error(f"[ReviewerPlugin] 规则 '{key}' 正则编译失败: {e}")
         return rules
 
-@register("astrbot_plugin_hapemxg_inspect", "hapemxg", "hapemxg的审查插件", "1.1.1")
+# 注册插件，更新版本号
+@register("astrbot_plugin_hapemxg_inspect", "hapemxg", "hapemxg的审查插件", "1.2.0")
 class ReviewerPlugin(Star):
     """
-    这是hapemxg的LLM回复审查插件。
+    ReviewerPlugin - LLM内容合规性审查插件
+    提供基于正则的快速审查和基于LLM的深度审查，支持自动重试、备用模型切换及多模态内容处理。
     """
     PLUGIN_ID = "ReviewerPlugin"
+    NON_TEXT_MESSAGE_PLACEHOLDER = "[用户发送了非文本消息]"
 
     def __init__(self, context: Context, config: AstrBotConfig):
-        """
-        插件初始化方法。
-        在AstrBot加载插件时被调用，负责加载配置、初始化内部状态和启动后台任务。
-        """
+        """初始化插件、配置、Provider及持久化机制"""
         super().__init__(context)
-        # **[MODIFIED]** 将配置管理委托给专门的配置类
         self.plugin_config = ReviewerConfig(raw_config=config)
         
-        # 审查提供商实例，采用懒加载模式，在首次需要时再获取
+        # 审查模型 Provider (延迟加载)
         self.reviewer_provider = None
-        # **[NEW]** 添加异步锁以保护延迟初始化
         self.provider_init_lock = asyncio.Lock()
 
-        # --- 持久化与历史记录设置 ---
+        # 初始化备用模型 (Fallback Provider)
+        self.fallback_provider = None
+        if self.plugin_config.fallback_provider_id and self.plugin_config.switch_provider_after_retries > 0:
+            self.fallback_provider = self.context.get_provider_by_id(self.plugin_config.fallback_provider_id)
+            if self.fallback_provider:
+                logger.info(f"[ReviewerPlugin] 备用模型 '{self.plugin_config.fallback_provider_id}' 加载成功。")
+            else:
+                logger.warning(f"[ReviewerPlugin] 无法加载配置的备用模型 '{self.plugin_config.fallback_provider_id}'，备用功能将失效。")
+
+        # --- 历史记录持久化设置 ---
         data_root = StarTools.get_data_dir(self.__class__.PLUGIN_ID)
         data_root.mkdir(parents=True, exist_ok=True)
         self.history_file_path = data_root / "approved_history.json"
@@ -192,104 +243,109 @@ class ReviewerPlugin(Star):
         
         self.approved_history = self._load_history()
 
-        # --- 启动后台任务 ---
+        # --- 启动后台保存任务 ---
         self.save_task = asyncio.create_task(self._periodic_save_task())
-        logger.info(f"[ReviewerPlugin] 后台历史保存任务已启动，保存间隔: {self.plugin_config.save_interval_seconds} 秒。")
+        if self.plugin_config.log_to_console:
+            logger.info(f"[ReviewerPlugin] 插件初始化完成。")
 
     async def terminate(self):
-        """
-        插件终止方法。
-        在AstrBot卸载或停止插件时调用，用于执行清理工作，确保资源被正确释放，数据被完整保存。
-        """
-        logger.info("[ReviewerPlugin] 插件正在终止，准备执行最终的历史记录保存...")
+        """插件停止时的清理工作"""
+        logger.info("[ReviewerPlugin] 正在停止插件...")
         self.save_task.cancel()
         try:
             await self.save_task
         except asyncio.CancelledError:
-            logger.info("[ReviewerPlugin] 后台保存任务已成功取消。")
+            pass
         
         if self.history_dirty:
             await self._save_history()
-            logger.info("[ReviewerPlugin] 最终的历史记录已成功保存到磁盘。")
-        else:
-            logger.info("[ReviewerPlugin] 历史记录无变化，无需执行最终保存。")
+            logger.info("[ReviewerPlugin] 最终历史记录已保存。")
 
     def _load_history(self) -> defaultdict:
-        """从JSON文件中加载已通过审查的对话历史。"""
+        """加载历史记录文件"""
         context_depth = self.plugin_config.deep_review_context_depth
         try:
             with open(self.history_file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                history = defaultdict(
+                return defaultdict(
                     lambda: deque(maxlen=context_depth),
                     {key: deque(value, maxlen=context_depth) for key, value in data.items()}
                 )
-                logger.info(f"[ReviewerPlugin] 从 '{self.history_file_path}' 成功加载 {len(history)} 条会话历史。")
-                return history
         except (FileNotFoundError, json.JSONDecodeError):
-            logger.info(f"[ReviewerPlugin] 未找到历史文件或文件格式错误，将创建新的历史记录。")
             return defaultdict(lambda: deque(maxlen=context_depth))
 
     async def _save_history(self):
-        """将内存中的对话历史异步保存到JSON文件。"""
+        """保存历史记录到文件"""
         if not self.history_dirty: return
+        
+        # 清理过期会话（简单的容量限制策略）
+        MAX_SESSIONS = 500
         async with self.history_lock:
             try:
+                if len(self.approved_history) > MAX_SESSIONS:
+                    keys_to_remove = list(self.approved_history.keys())[:(len(self.approved_history) - MAX_SESSIONS)]
+                    for k in keys_to_remove: del self.approved_history[k]
+
                 history_to_save = {key: list(value) for key, value in self.approved_history.items()}
                 with open(self.history_file_path, 'w', encoding='utf-8') as f:
                     json.dump(history_to_save, f, ensure_ascii=False, indent=4)
                 self.history_dirty = False
                 if self.plugin_config.log_to_console:
-                    logger.info(f"[ReviewerPlugin] 历史记录已成功保存到 '{self.history_file_path}'。")
+                    logger.info("[ReviewerPlugin] 历史记录已同步至磁盘。")
             except Exception as e:
-                logger.error(f"[ReviewerPlugin] 保存历史记录到 '{self.history_file_path}' 失败: {e}", exc_info=True)
+                logger.error(f"[ReviewerPlugin] 保存历史记录失败: {e}", exc_info=True)
 
     async def _periodic_save_task(self):
-        """作为后台任务运行的守护进程，周期性地检查并保存历史记录。"""
+        """后台任务：定期检查并保存历史记录"""
         while True:
             try:
                 await asyncio.sleep(self.plugin_config.save_interval_seconds)
                 if self.history_dirty:
-                    if self.plugin_config.log_to_console:
-                        logger.info("[ReviewerPlugin] 检测到历史记录变更，执行定期保存...")
                     await self._save_history()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[ReviewerPlugin] 后台保存任务出现严重错误: {e}", exc_info=True)
+                logger.error(f"[ReviewerPlugin] 后台任务异常: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
     def _perform_fast_review(self, text: str) -> Tuple[bool, str]:
-        """执行快速审查，依次检查黑名单和白名单规则。"""
+        """执行正则快速审查"""
+        # 1. 检查黑名单
         for rule_name, rule_data in self.plugin_config.blacklist_rules.items():
             match = rule_data["regex"].search(text)
             if match:
                 trigger_word = match.group(0)
-                final_prompt = rule_data["prompt"].format(trigger_word=trigger_word)
-                if self.plugin_config.log_to_console: logger.warning(f"[ReviewerPlugin] 快速审查命中黑名单规则: '{rule_name}' (触发词: '{trigger_word}')")
-                return False, final_prompt
+                if self.plugin_config.log_to_console: logger.warning(f"[ReviewerPlugin] 命中黑名单: '{rule_name}' (触发词: {trigger_word})")
+                return False, rule_data["prompt"].format(trigger_word=trigger_word)
         
+        # 2. 检查白名单
         failed_prompts = [rule_data["prompt"] for rule_name, rule_data in self.plugin_config.whitelist_rules.items() if not rule_data["regex"].search(text)]
         if failed_prompts:
-            if self.plugin_config.log_to_console: logger.warning(f"[ReviewerPlugin] 快速审查未满足 {len(failed_prompts)} 条白名单规则。")
+            if self.plugin_config.log_to_console: logger.warning(f"[ReviewerPlugin] 未满足 {len(failed_prompts)} 条白名单规则。")
             return False, "\n".join(failed_prompts)
+            
         return True, ""
 
     def _parse_review_result(self, text: str) -> dict:
-        """解析审查模型返回的文本，提取审查结果。优先尝试解析JSON，失败则回退到更鲁棒的正则。"""
+        """
+        解析审查模型的返回结果。
+        策略：优先尝试标准JSON解析，若失败则使用增强的正则提取（Regex Fallback）。
+        """
         try:
+            # 尝试清理Markdown标记并解析JSON
             cleaned_text = re.sub(r'```json\s*|\s*```', '', text).strip()
             data = json.loads(cleaned_text)
             result = {key: value.get("result", self.plugin_config.PASS).upper() for key, value in data.items() if isinstance(value, dict)}
             result.update({f"{key}{self.plugin_config.REASON_SUFFIX}": value.get("reason", "") for key, value in data.items() if isinstance(value, dict)})
             return result
         except (json.JSONDecodeError, TypeError):
-            # **[MODIFIED]** 增强的、更鲁棒的后备正则解析逻辑
-            if self.plugin_config.log_to_console: logger.warning("[ReviewerPlugin] 审查模型返回的不是标准JSON，尝试使用增强的正则解析。")
+            # JSON解析失败，启用正则回退机制
+            if self.plugin_config.log_to_console: logger.warning("[ReviewerPlugin] JSON解析失败，启用正则提取模式。")
             result = {}
             if not self.plugin_config.reviewer_provider_id: return result
 
-            enabled_categories: List[Tuple[str, str, int]] = []
+            # 确定启用的审查类别及其在文本中的位置
+            enabled_categories = []
             for key, cfg in self.plugin_config.review_configs.items():
                 if cfg["enabled"]:
                     match = re.search(re.escape(cfg["name"]), text)
@@ -298,6 +354,7 @@ class ReviewerPlugin(Star):
             
             enabled_categories.sort(key=lambda x: x[2])
 
+            # 逐块解析
             for i, (key, name, start_index) in enumerate(enabled_categories):
                 end_index = enabled_categories[i + 1][2] if i + 1 < len(enabled_categories) else len(text)
                 block = text[start_index:end_index]
@@ -310,8 +367,9 @@ class ReviewerPlugin(Star):
             
             return result
 
-    async def _perform_single_review_cycle(self, text_to_review: str, user_prompt: str, user_session_key: str) -> ReviewCycleResult:
-        """执行一个完整的、单次的审查流程（包括快速和深度审查）。"""
+    async def _perform_single_review_cycle(self, text_to_review: str, user_prompt: str, user_session_key: str, image_urls: Optional[List[str]] = None) -> ReviewCycleResult:
+        """执行单次完整的审查流程 (快速审查 + 深度审查)"""
+        # 1. 快速审查
         if self.plugin_config.fast_review_enabled:
             passed, reason = self._perform_fast_review(text_to_review)
             if not passed:
@@ -320,114 +378,230 @@ class ReviewerPlugin(Star):
         if not self.plugin_config.reviewer_provider_id:
             return ReviewCycleResult(is_passed=True, review_comment="")
 
-        # **[MODIFIED]** 使用异步锁和双重检查锁定来安全地进行延迟初始化
+        # 2. 获取审查模型 (懒加载)
         if not self.reviewer_provider:
             async with self.provider_init_lock:
                 if not self.reviewer_provider:
                     self.reviewer_provider = self.context.get_provider_by_id(self.plugin_config.reviewer_provider_id)
                     if not self.reviewer_provider:
-                        logger.warning(f"[ReviewerPlugin] 运行时无法找到ID为 '{self.plugin_config.reviewer_provider_id}' 的审查提供商，本次将跳过深度审查。")
+                        logger.warning(f"[ReviewerPlugin] 审查模型 '{self.plugin_config.reviewer_provider_id}' 不可用，跳过深度审查。")
                         return ReviewCycleResult(is_passed=True, review_comment="")
         
         try:
+            # 3. 构造审查上下文
             past_dialogue = list(self.approved_history[user_session_key])
             history_str = "".join(f"历史轮次 {i+1} - 用户: {q}\n历史轮次 {i+1} - 模型: {a}\n\n" for i, (q, a) in enumerate(past_dialogue)) if past_dialogue else "(无历史对话)\n\n"
-            review_prompt = (f"...\n--- 对话历史参考 ---\n{history_str}--- 当前待审查的对话 ---\n用户的最新提问: {user_prompt}\n待审查的回复: {text_to_review}")
-            if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 【深度审查】请求:\n---\n{review_prompt}\n---")
-
-            review_resp = await self.reviewer_provider.text_chat(prompt=review_prompt, session_id=f"reviewer_{user_session_key}", system_prompt=self.plugin_config.final_reviewer_system_prompt)
-            review_text = review_resp.completion_text.strip()
-            if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 【深度审查】模型判断:\n---\n{review_text}\n---")
             
+            # [关键更新] 处理审查模型的多模态支持
+            final_image_urls = None
+            image_hint_prompt = ""
+
+            if image_urls:
+                if self.plugin_config.reviewer_is_multimodal:
+                    # 审查模型支持看图 -> 传入图片
+                    final_image_urls = image_urls
+                else:
+                    # 审查模型不支持看图 -> 不传图片，注入文本提示
+                    final_image_urls = None
+                    image_hint_prompt = f"\n[系统提示：用户在本次对话中发送了 {len(image_urls)} 张图片，但由于技术限制你无法查看。请仅基于文本内容进行审查。]"
+            
+            review_prompt = (f"...\n--- 对话历史参考 ---\n{history_str}--- 当前待审查的对话 ---\n用户的最新提问: {user_prompt}{image_hint_prompt}\n待审查的回复: {text_to_review}")
+            
+            if self.plugin_config.log_to_console:
+                logger.info(f"[ReviewerPlugin] 发起深度审查 (包含 {len(final_image_urls) if final_image_urls else 0} 张图片)")
+                # [!!! 这里是加回来的日志 !!!]
+                logger.info(f"[ReviewerPlugin] 完整审查Prompt:\n---\n{review_prompt}\n---")
+
+            # 4. 调用审查模型
+            review_resp = await self.reviewer_provider.text_chat(
+                prompt=review_prompt,
+                session_id=f"reviewer_{user_session_key}",
+                system_prompt=self.plugin_config.final_reviewer_system_prompt,
+                image_urls=final_image_urls # 使用处理后的URL列表
+            )
+            review_text = review_resp.completion_text.strip()
+            if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 审查结果:\n{review_text}")
+            
+            # 5. 解析结果
             parsed = self._parse_review_result(review_text)
             if not parsed:
+                # 严重错误：无法解析结果
                 is_passed = not self.plugin_config.strict_mode
-                return ReviewCycleResult(is_passed=is_passed, review_comment="审查模型返回格式无法解析", failed_categories=["审查模型解析失败"], is_critical_error=not is_passed)
+                return ReviewCycleResult(is_passed=is_passed, review_comment="审查结果格式错误", failed_categories=["Format Error"], is_critical_error=not is_passed)
             
             failed_categories = [key for key, cfg in self.plugin_config.review_configs.items() if cfg["enabled"] and parsed.get(key) == self.plugin_config.FAIL]
             if failed_categories:
-                guidance = "\n".join(filter(None, [self.plugin_config.retry_guidance.get(k, "").format(reason=parsed.get(f"{k}{self.plugin_config.REASON_SUFFIX}", "未提供具体理由")) for k in failed_categories]))
+                # 审查未通过，生成指导意见
+                guidance = "\n".join(filter(None, [self.plugin_config.retry_guidance.get(k, "").format(reason=parsed.get(f"{k}{self.plugin_config.REASON_SUFFIX}", "无理由")) for k in failed_categories]))
                 failed_names = [self.plugin_config.review_configs[key]["name"] for key in failed_categories]
                 return ReviewCycleResult(is_passed=False, review_comment=guidance, failed_categories=failed_names)
         
         except Exception as e:
-            logger.error(f"[ReviewerPlugin] 调用审查模型时发生严重错误: {e}", exc_info=True)
+            logger.error(f"[ReviewerPlugin] 深度审查发生异常: {e}", exc_info=True)
             is_passed = not self.plugin_config.strict_mode
-            return ReviewCycleResult(is_passed=is_passed, review_comment=self.plugin_config.internal_error_message, failed_categories=["审查模型调用失败"], is_critical_error=not is_passed)
+            return ReviewCycleResult(is_passed=is_passed, review_comment="Review Internal Error", failed_categories=["Internal Error"], is_critical_error=not is_passed)
         
         return ReviewCycleResult(is_passed=True, review_comment="")
 
-    async def _regenerate_response(self, original_request: ProviderRequest, session_id: str, failed_response: str, review_comment: str, user_prompt: str) -> str:
-        """当审查失败时，调用主LLM以重新生成回复。"""
-        main_provider = self.context.get_using_provider()
-        retry_instruction = self.plugin_config.retry_instruction_prompt.format(review_comment=review_comment, failed_response=failed_response, user_prompt=user_prompt)
+    async def _regenerate_response(self, provider_to_use, original_request: ProviderRequest, session_id: str, failed_response: str, review_comment: str, user_prompt: str, image_urls: Optional[List[str]] = None, use_multimodal: bool = True) -> str:
+        """
+        修正回复逻辑 (Reflexion模式)。
+        将"错误回复"、"批评意见"和"原始问题"打包发回给LLM进行重写。
+        """
+        main_provider = provider_to_use
+        
+        # 多模态兼容处理（用于备用模型）
+        final_image_urls_for_llm = image_urls if use_multimodal else None
+        multimodal_context_hint = ""
+        if image_urls and not use_multimodal:
+            multimodal_context_hint = f"\n\n[System Note: User sent {len(image_urls)} images, but you cannot see them now. Reply based on text only.]"
+
+        # 智能构建包含上下文的 User Prompt
+        original_full_prompt = original_request.prompt
+        clean_user_prompt = user_prompt.strip()
+        
+        if clean_user_prompt == self.NON_TEXT_MESSAGE_PLACEHOLDER:
+            user_prompt_with_context = original_full_prompt
+        else:
+            # 尝试保留 Prompt 中的前缀 (如系统注入的上下文)
+            prefix_to_preserve = ""
+            last_occurrence_index = original_full_prompt.rfind(clean_user_prompt)
+            if last_occurrence_index != -1 and original_full_prompt[last_occurrence_index:].strip() == clean_user_prompt:
+                prefix_to_preserve = original_full_prompt[:last_occurrence_index]
+            else:
+                 if original_full_prompt.strip().endswith(clean_user_prompt):
+                    prefix_to_preserve = original_full_prompt.strip()[:-len(clean_user_prompt)]
+            user_prompt_with_context = prefix_to_preserve + clean_user_prompt
+
+        # 组装重试指令
+        retry_instruction_template = self.plugin_config.retry_instruction_prompt.format(
+            review_comment=review_comment,
+            failed_response=failed_response,
+            user_prompt=user_prompt_with_context 
+        )
+        final_prompt_for_llm = retry_instruction_template + multimodal_context_hint
+        
         retry_contexts = original_request.contexts.copy()
         retry_contexts.append({"role": "assistant", "content": failed_response})
         final_retry_system_prompt = self.plugin_config.retry_system_prompt or original_request.system_prompt
-        retry_response = await main_provider.text_chat(prompt=retry_instruction, session_id=session_id, contexts=retry_contexts, system_prompt=final_retry_system_prompt)
+        
+        # 调用模型生成修正后的回复
+        retry_response = await main_provider.text_chat(
+            prompt=final_prompt_for_llm,
+            session_id=session_id, 
+            contexts=retry_contexts, 
+            system_prompt=final_retry_system_prompt,
+            image_urls=final_image_urls_for_llm
+        )
         return retry_response.completion_text.strip()
 
     # --- AstrBot 事件钩子 ---
+    
     @event_filter.on_llm_request(priority=100)
     async def store_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """事件钩子：在LLM请求发出前触发。"""
+        """
+        钩子：在LLM请求发出前截获并存储上下文。
+        用于在后续的审查环节中还原原始请求信息。
+        """
         if self.plugin_config.enabled:
             setattr(event, '_original_llm_request_for_reviewer', req)
-            user_prompt_text = (event.message_str or "").strip()
-            if not user_prompt_text and event.message_obj.message:
-                final_user_prompt = "[用户发送了非文本消息]"
-            else:
-                final_user_prompt = user_prompt_text or req.prompt
-            setattr(event, '_user_prompt_for_reviewer', final_user_prompt)
+            setattr(event, '_image_urls_for_reviewer', req.image_urls or [])
+
+            user_prompt_to_store = getattr(event, '_translated_option_text', None)
+            if user_prompt_to_store is None:
+                user_prompt_to_store = (event.message_str or "").strip()
+
+            if not user_prompt_to_store and event.message_obj.message:
+                user_prompt_to_store = self.NON_TEXT_MESSAGE_PLACEHOLDER
+            
+            setattr(event, '_user_prompt_for_reviewer', user_prompt_to_store)
 
     @event_filter.on_llm_response(priority=10)
     async def review_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """事件钩子：在收到LLM响应后、发送给用户前触发。"""
+        """
+        钩子：在LLM响应后、发送给用户前进行拦截审查。
+        核心逻辑：白名单检查 -> 循环审查 -> (失败时) 切换备用模型重试 -> 最终放行或拦截
+        """
         if not self.plugin_config.enabled: return
         original_request = getattr(event, '_original_llm_request_for_reviewer', None)
         if not original_request: return
         
+        # 白名单用户检查
+        sender_id = str(event.get_sender_id())
+        if sender_id in self.plugin_config.whitelisted_user_ids:
+            if self.plugin_config.log_to_console:
+                logger.info(f"[ReviewerPlugin] 用户 {sender_id} 在白名单中，跳过审查。")
+            return
+
         user_prompt = getattr(event, '_user_prompt_for_reviewer', original_request.prompt)
+        image_urls = getattr(event, '_image_urls_for_reviewer', [])
+        
         session_id = event.unified_msg_origin
         user_session_key = f"{session_id}_{event.get_sender_id()}"
         current_response_text = resp.completion_text
         max_attempts = self.plugin_config.max_attempts
+        main_provider = self.context.get_using_provider()
 
+        # 开始审查-修正循环
         for attempt in range(1, max_attempts + 1):
             if self.plugin_config.log_to_console:
-                logger.info(f"[ReviewerPlugin] (Session: {user_session_key}) 开始第 {attempt}/{max_attempts} 次审查...")
-                logger.info(f"[ReviewerPlugin] 待审查内容:\n---\n{current_response_text}\n---")
+                logger.info(f"[ReviewerPlugin] (Session: {user_session_key}) 执行第 {attempt}/{max_attempts} 轮审查...")
             
-            review_result = await self._perform_single_review_cycle(current_response_text, user_prompt, user_session_key)
+            review_result = await self._perform_single_review_cycle(current_response_text, user_prompt, user_session_key, image_urls=image_urls)
 
+            # 严重错误处理
             if review_result.is_critical_error:
-                await event.send(event.plain_result(self.plugin_config.internal_error_message))
+                if self.plugin_config.send_error_message:
+                    await event.send(event.plain_result(self.plugin_config.internal_error_message))
                 event.stop_event()
                 return
             
+            # 审查通过
             if review_result.is_passed:
-                if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 第 {attempt} 次审查最终通过。")
+                if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 审查通过 (轮次: {attempt})。")
                 self.approved_history[user_session_key].append((user_prompt, current_response_text))
                 self.history_dirty = True
-                resp.completion_text = current_response_text
+                resp.completion_text = current_response_text # 更新最终回复
                 return
 
+            # 审查未通过，准备重试
             if self.plugin_config.log_to_console:
-                logger.warning(f"[ReviewerPlugin] 第 {attempt} 次审查驳回。违反规则: {', '.join(review_result.failed_categories)}。")
-                logger.warning(f"[ReviewerPlugin] 生成的指导意见:\n---\n{review_result.review_comment}\n---")
+                logger.warning(f"[ReviewerPlugin] 审查驳回: {', '.join(review_result.failed_categories)}。")
             
             if attempt >= max_attempts: break
 
             try:
-                if self.plugin_config.log_to_console: logger.info(f"[ReviewerPlugin] 准备第 {attempt + 1} 次生成...")
-                current_response_text = await self._regenerate_response(original_request, session_id, current_response_text, review_result.review_comment, user_prompt)
+                # 备用模型切换逻辑
+                provider_for_this_attempt = main_provider
+                use_multimodal_for_this_attempt = True 
+                
+                # 判断是否达到切换阈值
+                if self.fallback_provider and self.plugin_config.switch_provider_after_retries > 0 and attempt >= self.plugin_config.switch_provider_after_retries:
+                    provider_for_this_attempt = self.fallback_provider
+                    use_multimodal_for_this_attempt = self.plugin_config.fallback_provider_is_multimodal
+                    if self.plugin_config.log_to_console:
+                        logger.info(f"[ReviewerPlugin] 切换至备用模型 '{self.plugin_config.fallback_provider_id}' 进行重试。")
+                
+                # 调用模型生成修正回复
+                current_response_text = await self._regenerate_response(
+                    provider_for_this_attempt,
+                    original_request, 
+                    session_id, 
+                    current_response_text, 
+                    review_result.review_comment, 
+                    user_prompt,
+                    image_urls=image_urls,
+                    use_multimodal=use_multimodal_for_this_attempt
+                )
             except Exception as e:
-                logger.error(f"[ReviewerPlugin] 重新生成回复时发生严重错误: {e}", exc_info=True)
-                await event.send(event.plain_result(self.plugin_config.internal_error_message))
+                logger.error(f"[ReviewerPlugin] 重试生成失败: {e}", exc_info=True)
+                if self.plugin_config.send_error_message:
+                    await event.send(event.plain_result(self.plugin_config.internal_error_message))
                 event.stop_event()
                 return
         
-        logger.error(f"[ReviewerPlugin] 已达到最大尝试次数 ({max_attempts})，审查最终失败。")
+        # 最终失败处理
+        logger.error(f"[ReviewerPlugin] 达到最大重试次数 ({max_attempts})，拦截消息。")
         if self.plugin_config.send_failure_message:
             await event.send(event.plain_result(self.plugin_config.final_failure_message))
         event.stop_event()

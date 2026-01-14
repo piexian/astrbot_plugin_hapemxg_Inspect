@@ -125,9 +125,11 @@ class ReviewerConfig:
         )
 
         # 解析白名单用户ID
-        whitelisted_ids_str = self.raw_config.get(self.CfgKeys.WHITELISTED_USER_IDS, "")
+        whitelisted_ids_list = self.raw_config.get(
+            self.CfgKeys.WHITELISTED_USER_IDS, []
+        )
         self.whitelisted_user_ids = {
-            uid.strip() for uid in whitelisted_ids_str.splitlines() if uid.strip()
+            str(uid).strip() for uid in whitelisted_ids_list if str(uid).strip()
         }
         if self.whitelisted_user_ids and self.log_to_console:
             logger.info(
